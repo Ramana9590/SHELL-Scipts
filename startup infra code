@@ -1,0 +1,685 @@
+package utils
+
+import (
+   "bitbucket.org/swigy/dragonstone/config"
+   "bitbucket.org/swigy/dragonstone/constants"
+   "bitbucket.org/swigy/dragonstone/mysql"
+   "bitbucket.org/swigy/dragonstone/types"
+   "fmt"
+   "github.com/bramvdbogaerde/go-scp"
+   "github.com/bramvdbogaerde/go-scp/auth"
+   "github.com/fatih/color"
+   "github.com/golang/glog"
+   "github.com/sfreiberg/simplessh"
+   "golang.org/x/crypto/ssh"
+   "io/ioutil"
+   "os"
+   "sort"
+   "strconv"
+   "strings"
+   "sync"
+   "time"
+)
+
+func LaunchInfra() {
+
+   currentWD :=GetCurrentWD()
+   fmt.Println(currentWD)
+   config.InitializeConfig(currentWD + "/config/systemconfig.yml")
+   mysql.InitMysql()
+   tagMap:= GetTagMap()
+   sharedTagMap := GetTagMap()
+   sharedTagMap["pod"] = "shared"
+    baseOrg:=BaseOrg()
+
+   if LaunchOnlyAllEC2(){
+      LaunchAllEC2InstancesForAllServices(baseOrg)
+      return
+   }
+
+   if LaunchOnlyOneEC2(){
+      LaunchOneEC2InstanceForAllServices(baseOrg)
+      time.Sleep(15*time.Minute)
+      sanityCheck(baseOrg)
+
+      return
+   }
+
+   ClearKongTarget(baseOrg)
+
+   UpdateTagsForASGs(baseOrg,mysql.GetRegion(), tagMap)
+
+   RebootPerfBastion()
+
+   SleepOnTask()
+
+   glog.Infoln("Restoring all Redislabs DB size...........................")
+   var wg sync.WaitGroup
+   wg.Add(1)
+   go BumpUpRedisLabsDBs(baseOrg,&wg)
+
+   var wg1 sync.WaitGroup
+   wg1.Add(2)
+   go CreateElasticCache(mysql.GetRegion(), tagMap, &wg1)
+   go RestoreRds(mysql.GetRegion(), tagMap, &wg1)
+   wg1.Wait()
+
+   SleepOnTask()
+   time.Sleep(30 * time.Minute)
+
+    // calling user insert in goroutine
+   wg.Add(1)
+    glog.Info("Starting Insert user script")
+   go InsertUser(&wg,constants.MOBILE_STARTING_RANGE,constants.NO_OF_USERS)
+
+    //changing Dash config DB password
+   glog.Info("Changing dash db password")
+    go ChangeDashConfigDBPassword()
+
+   BringUpHapandKongServices(sharedTagMap)
+
+   StartRedisHaProxyInstances(sharedTagMap)
+
+   SleepOnTask()
+   var wg2 sync.WaitGroup
+   wg2.Add(1)
+   go StartRabbitMQInstances(sharedTagMap, &wg2)
+   wg2.Add(1)
+   go StartZKInstances(sharedTagMap, &wg2)
+   SleepOnTask()
+   SleepOnTask()
+   wg2.Add(1)
+   go StartKafkaInstances(sharedTagMap, &wg2)
+   wg2.Add(1)
+   go StartDeployer(&wg2)
+   wg2.Add(1)
+   go StartMongoDB(sharedTagMap,&wg2)
+   wg2.Wait()
+
+   SleepOnTask()
+   RebootRedisHaProxyInstances()
+   SleepOnTask()
+
+   if IsConsulUpdate() {
+      PerformConsulUpdate(baseOrg)
+   }
+
+    //setting spotInst to true by default for bringing up EC2 hosts except for kong
+   //os.Setenv("UseSpotInst", "true")
+   SleepOnTask()
+   LaunchListingNPolygonSolr(baseOrg)
+   SleepOnTask()
+   SleepOnTask()
+   SleepOnTask()
+   SleepOnTask()
+   LaunchSessionService(baseOrg)
+   SleepOnTask()
+   SleepOnTask()
+   SleepOnTask()
+   SleepOnTask()
+   SleepOnTask()
+   var wg3 sync.WaitGroup
+    wg3.Add(1)
+   go UpdateAvailCache(&wg3)
+   if GetnumberOfEC2Instances() == constants.INSTANCE_COUNT_ONE {
+      LaunchOneEC2InstanceForAllServices(baseOrg)
+      time.Sleep(15 * time.Minute)
+      sanityCheck(baseOrg)
+
+   } else {
+      LaunchAllEC2InstancesForAllServices(baseOrg)
+   }
+   time.Sleep(10 * time.Minute)
+   RebootRedisHaProxyInstances()
+
+   glog.Infoln("Starting all the CLIENT MACHINES............................")
+   StartInstances_TagBased(tagMap,constants.INSTANCE_TAG_CLIENTMACHINES)
+   SleepOnTask()
+   glog.Info("Started All CLIENT MACHINES!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
+   wg.Wait()
+   glog.Info("Restored all Redislabs DB size for all DBs!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
+   glog.Info("Importing S3 Prod backups for all Redislabs DBs!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+   RefreshRedisLabsDb(constants.REGION_AP_SOUTHEAST_1,baseOrg)
+   glog.Info("Imported S3 backups for all Redislabs DBs!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
+   glog.Info("Waiting for Warmup Avail cache script to complete")
+   wg3.Wait()
+}
+
+func sanityCheck(baseOrg string) {
+   cleanUpKong(baseOrg)
+   time.Sleep(1 * time.Minute)
+   kongSanityMap := PerformSanityCheck(baseOrg)
+   for k, v := range kongSanityMap {
+      fmt.Println(k, v)
+   }
+}
+
+
+func UpdateAvailCache(wg3 *sync.WaitGroup){
+
+   glog.Info("UpdateRestaurantMenuCache started...................")
+   UpdateRestaurantMenuCache()
+   glog.Info("UpdateRestaurantMenuCache completed.................")
+   time.Sleep(1*time.Minute)
+   glog.Info("UpdateItemAvailCache started............. ...........")
+   UpdateItemAvailCache()
+   glog.Info("UpdateItemAvailCache completed...............")
+
+   wg3.Done()
+}
+
+
+
+
+func UpdateTagsForASGs(baseOrg string,region string,tagMap map[string]string){
+
+   glog.Info("Setting Tags For All ASGs............................")
+   batchSize:=20
+   var wg sync.WaitGroup
+   activeServices, servicesErr := GetActiveServicesOrg(baseOrg)
+   if servicesErr != nil {
+      glog.Errorln("Not able to get the services from the DB for the base pod")
+   }
+   for cnt, service := range activeServices {
+      wg.Add(1)
+       go mysql.SetTagForASG(region,service.Name,tagMap,&wg)
+      if service.Spotinstid != "" {
+         mysql.ModifySpotInstTags(service.Spotinstid,service.Name,GetSuborg(),GetPod())
+      }
+      if  cnt%batchSize == 0 && cnt > 0 {
+         time.Sleep(15 * time.Second)
+      }
+   }
+    wg.Wait()
+   glog.Info("Setting Tags For All ASGs Completed!!!!!!!!!!!!!!!!")
+
+}
+
+func UpdateTagsForASGs_PodBased(baseOrg string,region string,podName string,tagMap map[string]string){
+
+   glog.Info("Setting Tags For ASGs for Pod: ",podName," ............................")
+   batchSize:=20
+   var wg sync.WaitGroup
+   activeServices, servicesErr := GetActiveServiceNames_Podbased(baseOrg,podName)
+
+
+   if servicesErr != nil {
+      glog.Errorln("Not able to get the services from the DB for the pod: ", podName)
+   }
+   for cnt, service := range activeServices {
+      wg.Add(1)
+      go mysql.SetTagForASG(region,service.Name,tagMap,&wg)
+      if service.Spotinstid != "" {
+         mysql.ModifySpotInstTags(service.Spotinstid,service.Name,GetSuborg(),GetPod())
+      }
+      if  cnt%batchSize == 0 && cnt > 0 {
+         time.Sleep(15 * time.Second)
+      }
+   }
+   wg.Wait()
+   glog.Info("Setting Tags For All ASGs for Pod: ",podName," Completed!!!!!!!!!!!!!!!!")
+
+}
+
+// Function to update Tags for RDS instances
+func UpdateTagsForRDS(baseOrg string,region string,tagMap map[string]string){
+
+   glog.Info("Setting Tags For All RDS............................")
+   batchSize:=20
+   var wg sync.WaitGroup
+   activeRDS, RDSErr := GetActiveRdsInstancesOrg(baseOrg)
+   if RDSErr != nil {
+      glog.Errorln("Not able to get the RDS from the DB")
+   }
+   for cnt, rdsdata := range activeRDS {
+      wg.Add(1)
+      go mysql.SetTagsRDS(region,rdsdata.Name,tagMap,&wg)
+      if  cnt%batchSize == 0 && cnt > 0 {
+         time.Sleep(15 * time.Second)
+      }
+   }
+   wg.Wait()
+   glog.Info("Setting Tags For All RDS Completed!!!!!!!!!!!!!!!!")
+}
+
+// Function to update Tags for Elastic Cache instances
+func UpdateTagsForElasticCache(baseOrg string,region string,tagMap map[string]string){
+
+   glog.Info("Setting Tags For All Elastic Cache............................")
+   batchSize:=20
+   var wg sync.WaitGroup
+   activeEC, ecErr := GetActiveElasticCacheInstancesOrg(baseOrg)
+   if ecErr != nil {
+      glog.Errorln("Not able to get the Elastic Caches from the DB")
+   }
+   for cnt, ecdata := range activeEC {
+      wg.Add(1)
+      go mysql.SetTagsEC(region,ecdata.Cachename,ecdata.Numofnodes,tagMap,&wg)
+      if  cnt%batchSize == 0 && cnt > 0 {
+         time.Sleep(15 * time.Second)
+      }
+   }
+   wg.Wait()
+   glog.Info("Setting Tags For All Elastic Cache Completed!!!!!!!!!!!!!!!!")
+}
+
+//Function to update kong.swiggyperf.in Route53 entry with existing kong instances form ASG
+func UpdateKongRoute53() {
+   kongInstanceIDs, err := mysql.GetAWSAutoScalingInstanceIds([]string{strings.ToLower(constants.KONG)})
+   if err != nil {
+      glog.Errorln("Not able to fetch the kong Instance IDs", err)
+   }
+   privateInstanceIPs, _, err := mysql.GetAWSAutoScalingInstanceIPs(kongInstanceIDs)
+   glog.Info("UPDATING ROUTE 53 For KONG............................")
+   // Update Route 53 Entries.
+   var vpcInfo types.VPCInfo
+   db := mysql.GetDBConnection()
+   if err := db.Table(constants.TABLE_VPCINFO).Where("env=?", "perf").Find(&vpcInfo).Error; err != nil {
+      glog.Errorln("Error Fetching Get VPC Info ", err)
+   }
+   updateErr := mysql.UpdateRoute53BasedOnType("kong.swiggyperf.in", privateInstanceIPs, vpcInfo.Rt53ZoneId, "A")
+   if updateErr != nil {
+      glog.Errorf("Not able to update the Route53 entry.The error is %s", updateErr)
+   }
+   SleepOnTask()
+   glog.Info("ROUTE 53 For KONG UPDATED!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+}
+
+
+func BringUpHapandKongServices(tagsMap map[string]string) {
+   glog.Info("HAP STARTING............................")
+   machineIPs, err := StartHAPInstances(tagsMap)
+   SleepOnTask()
+   glog.Info("HAP STARTED!!!!!")
+   glog.Info("KONG STARTING............................")
+   // Bump up the Kong ASG from 1 to 12.
+   kongErr := mysql.UpdateAWSAutoScalingMinMaxConfig(strings.ToLower(constants.KONG), int64(GetKongNodeCount()), int64(GetKongNodeCount()))
+   if kongErr != nil {
+      glog.Errorf("Not able to launch up the instances. The error is %s", err.Error())
+   }
+   _, waitErr := mysql.WaitForAWSAutoScalingInstances("perf-kong-autoscale", GetKongNodeCount(), constants.IN_SERVICE)
+   if waitErr != nil {
+      glog.Errorln("Wait For AutoScaling Instances Failed!!!")
+   }
+   glog.Infoln("All Kong Instances are up and running now !!!")
+   kongInstanceIDs, err := mysql.GetAWSAutoScalingInstanceIds([]string{strings.ToLower(constants.KONG)})
+   if err != nil {
+      glog.Errorln("Not able to fetch the kong Instance IDs", err)
+   }
+   privateInstanceIPs, _, err := mysql.GetAWSAutoScalingInstanceIPs(kongInstanceIDs)
+   createFileErr := GetKongRegisteredFile(privateInstanceIPs)
+   if createFileErr != nil {
+      glog.Errorln("New registered file creation got failed !!!")
+   }
+   for _, ip := range machineIPs {
+      err := CopyFileToRemoveInstance(ip)
+      if err != nil {
+         glog.Errorln("Not able to copy the file to remote machine", err)
+      }
+      executeErr := ExecCommandinRemote(ip,
+         constants.HAPROXYCFG_COPY_CMD,GetCurrentWD()+"/config/conman.pem")
+      if executeErr != nil {
+         glog.Errorln("Not able to execute the command to  the remote machine", executeErr)
+      }
+      executeErr = ExecCommandinRemote(ip,
+         constants.HAPROXY_RESTART_CMD,GetCurrentWD()+"/config/conman.pem")
+      if executeErr != nil {
+         glog.Errorln("Not able to execute the command to  the remote machine", executeErr)
+      }
+   }
+   SleepOnTask()
+   glog.Info("KONG STARTED!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+   glog.Info("HAP RESTARTING............................")
+   // Restart Haproxy Machines Inorder to update the new kong entries.
+   //instanceIDs, _ := GetHAproxyMachinesIds()
+   rebootErr := RestartHAPInstances()
+   if rebootErr != nil {
+      glog.Errorf("Not able to reboot the machines.", rebootErr)
+   }
+   SleepOnTask()
+   glog.Info("HAP Restarted!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+   glog.Info("UPDATING ROUTE 53 For KONG............................")
+   // Update Route 53 Entries.
+   var vpcInfo types.VPCInfo
+   db := mysql.GetDBConnection()
+   if err := db.Table(constants.TABLE_VPCINFO).Where("env=?", "perf").Find(&vpcInfo).Error; err != nil {
+      glog.Errorln("Error Fetching Get VPC Info ", err)
+   }
+   updateErr := mysql.UpdateRoute53BasedOnType("kong.swiggyperf.in", privateInstanceIPs, vpcInfo.Rt53ZoneId, "A")
+   if updateErr != nil {
+      glog.Errorf("Not able to update the Route53 entry.The error is %s", updateErr)
+   }
+   SleepOnTask()
+   glog.Info("ROUTE 53 For KONG UPDATED!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+   glog.Info("REBOOTING KingKong dashboard............................")
+   // Reboot KingKong DashBoard.
+   tagMap := GetHashMapForKingKong()
+   kingkongID, err := mysql.GetEC2InstancesBasedOnTag(tagMap)
+   if err != nil {
+      glog.Errorln("Not able to get the kingkong instance from AWS Console", err)
+   }
+   rebootKongErr := mysql.RebootEC2Instances(kingkongID)
+   if rebootKongErr != nil {
+      glog.Errorf("Not able to reboot the machines.", rebootKongErr)
+   }
+   SleepOnTask()
+   glog.Info("REBOOTING KingKong dashboard Done!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
+}
+
+// Create a new Route 53 Entry based on type. Used currently for ASG CNAME creation
+func CreateRoute53Entry(nameEntry string, entryType string, routeValues []string) {
+
+   var vpcInfo types.VPCInfo
+   db := mysql.GetDBConnection()
+   if err := db.Table(constants.TABLE_VPCINFO).Where("env=?", "perf").Find(&vpcInfo).Error; err != nil {
+      glog.Errorln("Error Fetching Get VPC Info ", err)
+   }
+   updateErr := mysql.CreateRoute53BasedOnType(nameEntry, routeValues, vpcInfo.Rt53ZoneId, entryType)
+   if updateErr != nil {
+      glog.Errorf("Not able to update the Route53 entry.The error is %s", updateErr)
+   }
+}
+
+func StartHAPInstances(tagsMap map[string]string) ([]string, error) {
+   machineIPs, err := StartEC2Instances(tagsMap,constants.INSTANCE_TAG_HAPROXY,constants.INSTANCE_STATE_STOPPED,nil,mysql.GetRegion())
+   glog.Infoln("The machines ips for HA Proxy are ", machineIPs)
+   if err != nil {
+      glog.Errorln("Not able to bring up the HAP Machines", err)
+   }
+   return machineIPs, err
+}
+
+func StopHAPInstances(wg1 *sync.WaitGroup) error {
+
+   if wg1 != nil {
+      defer wg1.Done()
+   }
+
+   glog.Info("Stopping HAP............................")
+
+   err := StopEC2Instances(constants.DEFAULT_ENV_TAG,constants.INSTANCE_TAG_HAPROXY,constants.INSTANCE_STATE_RUNNING,mysql.GetRegion())
+   if err != nil {
+      glog.Errorln("Not able to stop HAP Machines", err)
+   }
+   glog.Info(" Stopped HAP!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+   return err
+}
+
+func RestartHAPInstances() error {
+   err := RebootEC2Instances(constants.DEFAULT_ENV_TAG,constants.INSTANCE_TAG_HAPROXY)
+   if err != nil {
+      glog.Errorln("Not able to stop HAP Machines", err)
+   }
+   return err
+}
+
+func StopEC2Instances(env string,tagName string,instancesState string,region string)error {
+   var targetInstances []string
+   m := make(map[string]string)
+   m["env"] = env
+   m["auto"] = tagName
+   targetInstances,err:=GetTargetEC2Instances(m,instancesState)
+   glog.Infof("The Instance IDs are %v ",targetInstances)
+   if targetInstances!=nil {
+      err = mysql.StopAWSInstances(targetInstances, region)
+      if err != nil {
+         glog.Errorln("Not able to Stop AWS instances", err)
+         return err
+      }
+   }
+   return nil
+}
+
+
+
+func StartEC2Instances(tagsMap map[string]string,tagName string,instancesState string,reqChan chan int,region string)  ([]string,error) {
+   var instanceIPs []string
+   var targetInstances []string
+   m := make(map[string]string)
+   m["env"] = tagsMap["env"]
+   m["auto"] = tagName
+   targetInstances,err:=GetTargetEC2Instances(m,instancesState)
+   if targetInstances!=nil{
+      _, err = mysql.StartAWSInstances(tagsMap,targetInstances, region, reqChan)
+      if err != nil {
+         glog.Errorln("Not able to start AWS instances", err)
+         return instanceIPs, err
+      }
+      if tagName==constants.CATEGORY_HAPROXY{
+         instanceIPs,err = mysql.GetPrivateInstanceIPs(targetInstances)
+         if err != nil {
+            glog.Errorln("Not able to get the instance IPs",err)
+            return instanceIPs,err
+         }
+      }
+
+   }
+
+
+
+   return instanceIPs,nil
+}
+
+
+
+
+
+func GetTargetEC2Instances( tagMap map[string]string, ec2State string )([]string,error){
+
+   var targetInstances []string
+   instanceIds,err := mysql.GetEC2InstancesBasedOnTag(tagMap)
+   if err!= nil {
+      glog.Errorln("GetTargetEC2Instances()--> unable to get the haproxy instances based on TagName ",err)
+      return targetInstances,err
+   }
+
+   for _,instances := range instanceIds {
+      instanceState,_ := mysql.GetEC2InstanceState(instances)
+      if instanceState == ec2State {
+         targetInstances = append(targetInstances, instances)
+      }
+   }
+   glog.Infof("GetTargetEC2Instances()-->The Instance IDs are %v ",instanceIds)
+   return targetInstances,nil
+}
+
+
+// Function to modify the haproxy configFile with the given kong IPs.
+func GetKongRegisteredFile(kongIPs []string) (error) {
+
+   input, err := ioutil.ReadFile(GetCurrentWD()+"/startupInfra/haproxy.cfg.txt")
+   if err != nil {
+      glog.Errorln("Not able to read the file contents ", err)
+      return err
+   }
+
+   lines := strings.Split(string(input), "\n")
+   var kong_config_str string
+   for i, line := range lines {
+      if strings.Contains(line, constants.KONG_REPLACE_STRING) {
+         for counter,ip := range kongIPs {
+            kong_config_str = kong_config_str+"  "+"server kong-perf-"+strconv.Itoa(counter+1)+" "+ip+":80 check"+ "\n"
+         }
+      }
+      if kong_config_str != "" {
+         lines[i] = kong_config_str
+         kong_config_str = ""
+      }
+   }
+   output := strings.Join(lines, "\n")
+   err = ioutil.WriteFile("./haproxy.cfg", []byte(output), 0640)
+   if err != nil {
+      glog.Errorf("Not able to create the modified config file ", err)
+      return err
+   }
+
+   glog.Infof("The haproxy file got generated succesfully with the latest kong ips %v",kongIPs)
+
+   return nil
+}
+
+// Function to Copy Files over SCP.
+func CopyFileToRemoveInstance(instanceIP string) error {
+   // Use SSH key authentication from the auth package
+   // we ignore the host key in this example, please change this if you use this library
+   clientConfig, _ := auth.PrivateKey(constants.USERNAME_CONMAN, GetCurrentWD()+"/config/conman.pem", ssh.InsecureIgnoreHostKey())
+
+   // For other authentication methods see ssh.ClientConfig and ssh.AuthMethod
+
+   // Create a new SCP client
+   client := scp.NewClient(instanceIP+":22", &clientConfig)
+
+   // Connect to the remote server
+   err := client.Connect()
+   if err != nil {
+      fmt.Println("Couldn't establisch a connection to the remote server ", err)
+      return err
+   }
+
+   // Open a file
+   f, _ := os.Open("./haproxy.cfg")
+
+   // Close client connection after the file has been copied
+   defer client.Close()
+
+   // Close the file after it has been copied
+   defer f.Close()
+
+   // Finally, copy the file over
+   // Usage: CopyFile(fileReader, remotePath, permission)
+
+   err = client.CopyFile(f, constants.HAPROXYCFG_HOME_PATH, "0640")
+
+   if err != nil {
+      glog.Errorf("Error while copying file to the remove instance %s." +
+         "The error is %s", instanceIP ,err)
+      return err
+   }
+
+   glog.Infof("The file is sucessfully scp'ed to remote machine %s", instanceIP)
+   return nil
+}
+
+// Function to get HAProxy Machine IDs.
+func GetHAproxyMachinesIds() ([]string,error) {
+   var instances []types.External
+   var instanceIds []string
+   db := mysql.GetDBConnection()
+   err := db.Table(constants.EXTERNAL).Where("category=?",constants.CATEGORY_HAPROXY).Find(&instances).Error
+   if err!= nil {
+      glog.Errorln("Not able to get the haproxy instances",err)
+      return instanceIds,err
+   }
+
+   for _,instances := range instances {
+      instanceIds = append(instanceIds, instances.Instances)
+   }
+   glog.Infof("The Instance IDs are %v ",instanceIds)
+   return instanceIds,nil
+}
+
+// Function to get KingKong Instance ID.
+func GetKingKongMachinesId() (string,error) {
+   var instances []types.External
+   var instanceId string
+   db := mysql.GetDBConnection()
+   err := db.Table(constants.EXTERNAL).Where("category=?",constants.CATEGORY_KINGKONG).Find(&instances).Error
+   if err!= nil {
+      glog.Errorln("Not able to get the haproxy instances",err)
+      return instanceId,err
+   }
+
+   glog.Infof("The Instance ID are %s ",instanceId)
+   return instanceId,nil
+}
+
+// Function to Get Elastic Cache Instances from db.
+func GetActiveElasticCacheInstances() ([]types.Elasticcache,error) {
+
+   var caches []types.Elasticcache
+   baseOrg:=BaseOrg()
+   db := mysql.GetDBConnection()
+   err := db.Table(constants.ELASTICCACHE).Where("in_use=? and base_pod=?", 1,baseOrg).Find(&caches).Error
+   if err!= nil {
+      glog.Errorln("Not able to get the Active Elastic Cache instances",err)
+      return caches,err
+   }
+   return caches,nil
+}
+
+// Function to Get Elastic Cache Instances from db.
+func GetActiveElasticCacheInstances_Storefront() ([]types.Elasticcache,error) {
+
+   var caches []types.Elasticcache
+
+   db := mysql.GetDBConnection()
+   err := db.Table(constants.ELASTICCACHE).Where("in_use=? and is_requiredfor_storefront=?", 1,1).Find(&caches).Error
+   if err!= nil {
+      glog.Errorln("Not able to get the Active Elastic Cache instances",err)
+      return caches,err
+   }
+   return caches,nil
+}
+
+
+// Function to Get Elastic Cache Instances from db based on baseorg
+func GetActiveElasticCacheInstancesOrg(baseOrg string) ([]types.PerfElasticcacheDB,error) {
+
+   var caches []types.PerfElasticcacheDB
+
+   db := mysql.GetDBConnection()
+   if baseOrg == constants.SWIGGY_FOOD {
+      err := db.Table(constants.ELASTICCACHE).Where("in_use=? and base_pod=?", 1,baseOrg).Find(&caches).Error
+      if err!= nil {
+         glog.Errorln("Not able to get the Active Elastic Cache instances",err)
+         return caches,err
+      }
+   } else if baseOrg == constants.SWIGGY_DAILY {
+      err := db.Table(constants.ELASTICCACHE).Where("is_requiredfor_swiggydaily=?", 1).Find(&caches).Error
+      if err!= nil {
+         glog.Errorln("Not able to get the Active Elastic Cache instances",err)
+         return caches,err
+      }
+   } else if baseOrg == constants.SWIGGY_DASH {
+      err := db.Table(constants.ELASTICCACHE).Where("is_requiredfor_swiggydash=?", 1).Find(&caches).Error
+      if err!= nil {
+         glog.Errorln("Not able to get the Active Elastic Cache instances",err)
+         return caches,err
+      }
+
+   } else if baseOrg == constants.SWIGGY_ALL {
+      err := db.Table(constants.ELASTICCACHE).Where("in_use=?", 1).Find(&caches).Error
+      if err!= nil {
+         glog.Errorln("Not able to get the Active Elastic Cache instances",err)
+         return caches,err
+      }
+   } else{
+      podname := baseOrg
+      err := db.Table(constants.ELASTICCACHE).Where("in_use=? and pod_specific=?", 1,podname).Find(&caches).Error
+      if err!= nil {
+         glog.Errorln("Not able to get the Active Elastic Cache instances",err)
+         return caches,err
+      }
+
+
+   }
+
+
+
+   return caches,nil
+}
+
+// Function to Get Elastic Cache Instances from db based on pod
+func GetActiveElasticCacheInstancesFromPod(podName string) ([]types.Elasticcache,error) {
+
+   var caches []types.Elasticcache
+
+   db := mysql.GetDBConnection()
+   err := db.Table(constants.ELASTICCACHE).Where("pod=?", podName).Find(&caches).Error
+   if err!= nil {
+      glog.Errorln("Not able to get the Active Elastic Cache instances",err)
+      re
